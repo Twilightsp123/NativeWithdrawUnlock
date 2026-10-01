@@ -1,0 +1,10 @@
+# Editor / OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local diagnostic output
+script_log_*.txt
+*.bak
+*.tmp
