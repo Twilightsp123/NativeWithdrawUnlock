@@ -17,6 +17,26 @@ This is **not** campaign strategic Retreat, morale rout, teleport withdrawal, am
 ---
 
 
+## v1.2.0 — Automatic player-army bootstrap
+
+The native Withdraw solution remains global: different upstream restrictions such as ambushes, interceptions, settlement/garrison cases and scripted encounter battles still converge on the same `BATTLE_SETUP_ALLIANCE.can_withdraw` byte. No per-scenario compatibility list is used.
+
+The bootstrap has changed so that this common native gate can be reached without relying on the normal unit-selection lifecycle. After the battle reaches `Deployed`, the mod now:
+
+1. asks CA's battle manager for the local player army with `bm:get_player_army()`;
+2. if needed, enumerates `bm:alliances() -> armies()` and selects an `army:is_player_controlled()` army, mirroring CA's own generated-battle logic;
+3. enumerates that army's main units and, when present, reinforcement unit collections;
+4. uses a discovered unit only to run the existing `unique_ui_id` and native-army pointer cross-checks;
+5. resolves `battle_army + 0x140 -> BATTLE_SETUP_ALLIANCE`;
+6. reads and, when needed, writes exactly one byte at `+0x248`;
+7. restores the original CA Withdraw UI visibility as before.
+
+The old unit-selection handler is retained only as a fallback. A scripted/generated battle no longer needs to produce a normal player selection event for the mod to initialize.
+
+No native offsets, validator behavior, write width, UI hierarchy or maintenance logic changed in v1.2.0.
+
+---
+
 ## v1.1.0 — Deployment anchor lifecycle fix
 
 The current WH3 executable still uses the verified native layout documented below, including `BATTLE_SETUP_ALLIANCE.can_withdraw` at `+0x248`. Runtime logs from a restricted campaign battle exposed a separate lifecycle failure: the battle script loaded successfully and reached `Deployed`, but no native initialization attempt occurred.
@@ -523,7 +543,9 @@ The cleaned mod intentionally does as little as possible:
 ```text
 wait until Deployed
         |
-obtain one valid player battle.unit
+auto-discover the local player battle_army
+        |
+obtain one valid unit from that army for safety cross-checks
         |
 validate native pointer chain
         |
