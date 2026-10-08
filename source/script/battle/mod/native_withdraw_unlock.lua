@@ -32,14 +32,13 @@
 --       -> can_withdraw (uint8)
 --
 -- The script deliberately waits for phase == "Deployed" before any memory
--- access. Once Deployed, it discovers the local player army directly from the
--- battle manager and uses one of that army's units as the already-verified native
--- pointer anchor. Manual unit selection is retained only as a fallback.
+-- access. A unit selected during Deployment may be cached as the pointer anchor and is
+-- deliberately retained across the Deployment -> Deployed deselection churn.
 -- No memory is touched until the battle actually starts.
 -- ============================================================================
 
 local TAG = "[NATIVE_WITHDRAW_UNLOCK]"
-local VERSION = "1.2.0"
+local VERSION = "1.1.0"
 
 -- One-switch logging control.
 -- false = production/quiet; true = diagnostic logging.
@@ -225,183 +224,6 @@ end
 
 
 -- ============================================================================
--- Automatic player-army discovery
---
--- The native gate is alliance-level, so initialization must not depend on a
--- normal unit-selection lifecycle. Scripted/generated battles can alter or skip
--- ordinary Deployment selection churn. We therefore discover a player-controlled
--- battle_army directly and use one of its units only to retain the exact same
--- native safety checks in resolve_setup_alliance().
--- ============================================================================
-
-local function try_units_collection(units, source_label)
-    if not units then
-        return nil, nil, "missing units collection"
-    end
-
-    local ok_count, count = safe(function()
-        return units:count()
-    end)
-
-    if not ok_count or not count or count < 1 then
-        return nil, nil, "empty units collection"
-    end
-
-    local last_error = nil
-
-    for i = 1, count do
-        local ok_unit, unit = safe(function()
-            return units:item(i)
-        end)
-
-        if ok_unit and unit then
-            local setup, resolve_error = resolve_setup_alliance(unit)
-
-            if setup then
-                return setup, unit, source_label .. ":unit=" .. tostring(i)
-            end
-
-            last_error = resolve_error
-        end
-    end
-
-    return nil, nil, last_error or "no usable unit in collection"
-end
-
-
-local function try_player_army(army_obj, source_label)
-    if not army_obj then
-        return nil, nil, "missing army object"
-    end
-
-    local ok_controlled, controlled = safe(function()
-        return army_obj:is_player_controlled()
-    end)
-
-    if not ok_controlled or controlled ~= true then
-        return nil, nil, "army is not player-controlled"
-    end
-
-    local ok_units, units = safe(function()
-        return army_obj:units()
-    end)
-
-    if ok_units and units then
-        local setup, unit, detail = try_units_collection(units, source_label .. ":main")
-
-        if setup then
-            return setup, unit, detail
-        end
-    end
-
-    -- Some scripted/generated battles may expose useful units through a
-    -- reinforcement collection rather than the main collection. Try those too.
-    local ok_reinforcement_count, reinforcement_count = safe(function()
-        return army_obj:num_reinforcement_units()
-    end)
-
-    if ok_reinforcement_count and reinforcement_count and reinforcement_count > 0 then
-        for i = 1, reinforcement_count do
-            local ok_reinforcement_units, reinforcement_units = safe(function()
-                return army_obj:get_reinforcement_units(i)
-            end)
-
-            if ok_reinforcement_units and reinforcement_units then
-                local setup, unit, detail = try_units_collection(
-                    reinforcement_units,
-                    source_label .. ":reinforcement=" .. tostring(i)
-                )
-
-                if setup then
-                    return setup, unit, detail
-                end
-            end
-        end
-    end
-
-    return nil, nil, "player army had no unit that passed native validation"
-end
-
-
-local function discover_player_setup_alliance()
-    -- Fast path: CA battle_manager's own local-player army helper.
-    local ok_player_army, player_army = safe(function()
-        return bm:get_player_army()
-    end)
-
-    if ok_player_army and player_army then
-        local setup, unit, detail = try_player_army(player_army, "bm:get_player_army")
-
-        if setup then
-            return setup, unit, detail
-        end
-    end
-
-    -- Robust fallback: mirror CA's generated-battle logic and enumerate all
-    -- alliances/armies looking for an army explicitly marked player-controlled.
-    local ok_alliances, alliances = safe(function()
-        return bm:alliances()
-    end)
-
-    if not ok_alliances or not alliances then
-        return nil, nil, "bm:alliances() failed"
-    end
-
-    local ok_alliance_count, alliance_count = safe(function()
-        return alliances:count()
-    end)
-
-    if not ok_alliance_count or not alliance_count then
-        return nil, nil, "alliances:count() failed"
-    end
-
-    local last_error = nil
-
-    for alliance_index = 1, alliance_count do
-        local ok_alliance, alliance = safe(function()
-            return alliances:item(alliance_index)
-        end)
-
-        if ok_alliance and alliance then
-            local ok_armies, armies = safe(function()
-                return alliance:armies()
-            end)
-
-            if ok_armies and armies then
-                local ok_army_count, army_count = safe(function()
-                    return armies:count()
-                end)
-
-                if ok_army_count and army_count then
-                    for army_index = 1, army_count do
-                        local ok_army, army_obj = safe(function()
-                            return armies:item(army_index)
-                        end)
-
-                        if ok_army and army_obj then
-                            local setup, unit, detail = try_player_army(
-                                army_obj,
-                                "alliances=" .. tostring(alliance_index) ..
-                                ":army=" .. tostring(army_index)
-                            )
-
-                            if setup then
-                                return setup, unit, detail
-                            end
-
-                            last_error = detail
-                        end
-                    end
-                end
-            end
-        end
-    end
-
-    return nil, nil, last_error or "no player-controlled battle army found"
-end
-
-
--- ============================================================================
 -- Native gate
 -- ============================================================================
 
@@ -575,9 +397,24 @@ end
 -- One-time initialization
 -- ============================================================================
 
-local function initialize_from_setup(setup, source_label)
+local function initialize_from_unit(unit)
     if stopped or unlocked or current_phase() ~= "Deployed" then
-        return false
+        return
+    end
+
+    local setup, resolve_error = resolve_setup_alliance(unit)
+
+    if not setup then
+        if anchor_source_phase ~= "Deployed" then
+            log("Cached pre-Deployed anchor was not usable after battle start (" ..
+                tostring(resolve_error) .. "); waiting for a fresh player-unit selection.")
+            anchor_unit = nil
+            anchor_source_phase = nil
+            return
+        end
+
+        stop(resolve_error)
+        return
     end
 
     setup_alliance_ptr = setup
@@ -586,12 +423,11 @@ local function initialize_from_setup(setup, source_label)
 
     if not gate_ok then
         stop("failed enabling native Withdraw: " .. tostring(gate_error))
-        return false
+        return
     end
 
     unlocked = true
-    log("Native Withdraw unlocked for the local player's alliance via " ..
-        tostring(source_label or "unknown source") .. ".")
+    log("Native Withdraw unlocked for the local player's alliance.")
 
     -- Give CA a short window to propagate the native button state.
     bm:callback(function()
@@ -600,40 +436,13 @@ local function initialize_from_setup(setup, source_label)
             maintenance()
         end
     end, 300)
-
-    return true
-end
-
-
-local function initialize_from_unit(unit, source_label)
-    if stopped or unlocked or current_phase() ~= "Deployed" then
-        return false
-    end
-
-    local setup, resolve_error = resolve_setup_alliance(unit)
-
-    if not setup then
-        if anchor_source_phase ~= "Deployed" then
-            log("Cached pre-Deployed anchor was not usable after battle start (" ..
-                tostring(resolve_error) .. "); automatic discovery will continue.")
-            anchor_unit = nil
-            anchor_source_phase = nil
-            return false
-        end
-
-        log("Selection fallback could not resolve native chain: " .. tostring(resolve_error))
-        return false
-    end
-
-    return initialize_from_setup(setup, source_label or "selection fallback")
 end
 
 
 -- ============================================================================
--- Selection fallback
+-- Selection anchor
 --
--- Automatic player-army discovery is the primary bootstrap. A player selection
--- is cached only as a last-resort fallback. No memory access occurs until
+-- A selection during Deployment is only cached. No memory access occurs until
 -- phase == "Deployed".
 -- ============================================================================
 
@@ -673,39 +482,35 @@ function NATIVE_WITHDRAW_UNLOCK_SELECTION_HANDLER(unit, is_selected)
 end
 
 
-local function poll_for_initialization()
+local function poll_for_anchor()
     if stopped or unlocked then
         return
     end
 
-    if current_phase() == "Deployed" then
-        -- Primary path: discover the local player army directly. This works even
-        -- when scripted/generated battles skip or reorder normal unit selection.
-        local setup, discovered_unit, discovery_source = discover_player_setup_alliance()
+    local phase = current_phase()
 
-        if setup then
-            anchor_unit = discovered_unit
-            anchor_source_phase = "Deployed"
+    if phase == "Deployed" then
+        if anchor_unit then
+            local source_phase = anchor_source_phase
+            initialize_from_unit(anchor_unit)
 
-            if initialize_from_setup(setup, "auto-discovery " .. tostring(discovery_source)) then
+            if stopped or unlocked then
                 return
             end
-        end
 
-        -- Last-resort compatibility path for unusual battles where CA exposes a
-        -- selected player unit but army enumeration is temporarily unavailable.
-        if anchor_unit then
-            if initialize_from_unit(anchor_unit, "selection fallback") then
-                return
+            -- initialize_from_unit only returns without stop/unlock if a cached
+            -- pre-Deployed anchor was rejected as stale. Wait for a fresh player
+            -- selection instead of repeatedly retrying the same userdata.
+            if source_phase ~= "Deployed" and not anchor_unit then
+                waiting_for_anchor_logged = false
             end
         elseif not waiting_for_anchor_logged then
             waiting_for_anchor_logged = true
-            log("Phase=Deployed: automatic player-army discovery has not resolved yet; " ..
-                "selection fallback is also waiting for a player unit.")
+            log("Phase=Deployed but no player unit anchor is cached; waiting for the first player-unit selection.")
         end
     end
 
-    bm:callback(poll_for_initialization, 200)
+    bm:callback(poll_for_anchor, 200)
 end
 
 
@@ -730,10 +535,10 @@ local registered = safe(function()
     )
 end)
 
-if registered then
-    log("Unit selection fallback registered; primary bootstrap is automatic player-army discovery.")
-else
-    log("Unit selection fallback registration failed; automatic player-army discovery remains active.")
+if not registered then
+    log("Failed to register unit selection handler.")
+    return
 end
 
-bm:callback(poll_for_initialization, 200)
+log("Unit selection handler registered; preserving Deployment anchors across deselection.")
+bm:callback(poll_for_anchor, 200)
