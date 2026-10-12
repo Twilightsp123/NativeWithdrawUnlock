@@ -1,3 +1,27 @@
+> **Current maintained version: v1.1.2 (event-safe), user-confirmed working on 2026-10-12.**
+>
+> v1.1.2 removes NWU's direct registration of the exclusive native unit-selection
+> handler, which can compete with AI Army Control and other battle scripts. It uses
+> CA's shared Deployed phase callback and a 500ms pre-battle phase watcher.
+> After Deployed, it locates a validated battle unit from the **local player's
+> alliance**; if not yet ready, it makes at most eight spaced retries. It stops
+> searching on success (or after nine total attempts). The original native
+> pointer-chain checks, `BATTLE_SETUP_ALLIANCE +0x248` **uint8** write and low-frequency
+> post-unlock maintenance are retained.
+>
+> **Release identity:** `release/native_withdraw_unlock.pack` is byte-for-byte
+> the v1.1.2 event-safe candidate Pack that the user confirmed worked.
+> For traceability, its internal Lua `VERSION` string and embedded legacy
+> candidate notice are unchanged. Those labels are historical build identifiers,
+> not a different code version. Do not install the old v1.1.0 Pack alongside it.
+>
+> The historical v1.1.0 explanations below describe the previous selection-anchor
+> architecture, **not the current v1.1.2 initialization path**. See
+> [v1.1.2 compatibility notes](documentation/NWU_V1_1_2_COMPATIBILITY.md)
+> and [changelog](CHANGELOG.md).
+>
+---
+
 # Native Withdraw Unlock — Technical Notes
 
 ## Purpose

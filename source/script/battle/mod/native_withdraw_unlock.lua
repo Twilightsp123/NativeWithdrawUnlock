@@ -31,14 +31,14 @@
 --       -> + 0x248
 --       -> can_withdraw (uint8)
 --
--- The script deliberately waits for phase == "Deployed" before any memory
--- access. A unit selected during Deployment may be cached as the pointer anchor and is
--- deliberately retained across the Deployment -> Deployed deselection churn.
--- No memory is touched until the battle actually starts.
+-- Never touch memory before battle phase == "Deployed".
+-- Do not monopolize the native unit selection handler; other mods use it too.
+-- Use the shared CA phase callback and a short phase-watch fallback, then
+-- bounded retry attempts to obtain a battle_unit through the player alliance.
 -- ============================================================================
 
 local TAG = "[NATIVE_WITHDRAW_UNLOCK]"
-local VERSION = "1.1.0"
+local VERSION = "1.1.2-event-safe-candidate"
 
 -- One-switch logging control.
 -- false = production/quiet; true = diagnostic logging.
@@ -46,13 +46,15 @@ local LOG_ENABLED = false
 
 local mr = rawget(_G, "memreader")
 
-local anchor_unit = nil
-local anchor_source_phase = nil
 local setup_alliance_ptr = nil
 local unlocked = false
 local stopped = false
-local waiting_for_anchor_logged = false
 local ui_missing_logged = false
+local bootstrap_started = false
+local bootstrap_attempts = 0
+-- Initial attempt at Deployed, followed by eight increasingly sparse retries.
+-- Total additional scan window: 60.75 seconds. No scan runs after success.
+local RETRY_DELAYS_MS = {250, 500, 1000, 2000, 4000, 8000, 15000, 30000}
 
 
 local function log(message)
@@ -405,15 +407,10 @@ local function initialize_from_unit(unit)
     local setup, resolve_error = resolve_setup_alliance(unit)
 
     if not setup then
-        if anchor_source_phase ~= "Deployed" then
-            log("Cached pre-Deployed anchor was not usable after battle start (" ..
-                tostring(resolve_error) .. "); waiting for a fresh player-unit selection.")
-            anchor_unit = nil
-            anchor_source_phase = nil
-            return
-        end
-
-        stop(resolve_error)
+        -- Do not write through a failed native pointer chain. In the rare case
+        -- that a unit disappears between validation and initialization, let
+        -- the bounded retry find a different valid unit instead.
+        log("Validated unit became unusable: " .. tostring(resolve_error))
         return
     end
 
@@ -439,80 +436,163 @@ local function initialize_from_unit(unit)
 end
 
 
+
 -- ============================================================================
--- Selection anchor
+-- Player alliance unit discovery (no unit selection handler needed)
 --
--- A selection during Deployment is only cached. No memory access occurs until
--- phase == "Deployed".
+-- Search the player's alliance only. This is not an alternative memory
+-- layout: each candidate passes the original UID and independent army-pointer
+-- checks before the native gate is changed. Calls happen only during the
+-- bounded bootstrap attempts, never each simulation frame.
 -- ============================================================================
 
-function NATIVE_WITHDRAW_UNLOCK_SELECTION_HANDLER(unit, is_selected)
-    if stopped or unlocked then
-        return
+local function find_valid_unit_in_collection(units)
+    if not units then
+        return nil
     end
 
-    if not is_selected then
-        -- IMPORTANT: do not clear a cached Deployment anchor on deselection.
-        -- Newer WH3 builds may emit deselection while transitioning from
-        -- Deployment -> Deployed. The original script cleared anchor_unit here,
-        -- which could leave the mod waiting forever with no native init attempt.
-        return
-    end
-
-    local ok, controlled = safe(function()
-        return unit:is_player_controlled()
+    local ok_count, count = safe(function()
+        return units:count()
     end)
+    if not ok_count or type(count) ~= "number" or count < 1 then
+        return nil
+    end
 
-    if ok and controlled == true then
-        anchor_unit = unit
-        anchor_source_phase = current_phase()
-        waiting_for_anchor_logged = false
-
-        local ok_uid, uid = safe(function()
-            return unit:unique_ui_id()
+    for i = 1, count do
+        local ok_unit, unit = safe(function()
+            return units:item(i)
         end)
-
-        if ok_uid then
-            log("Cached player unit anchor uid=" .. tostring(uid) ..
-                " phase=" .. tostring(anchor_source_phase))
-        else
-            log("Cached player unit anchor phase=" .. tostring(anchor_source_phase))
+        if ok_unit and unit then
+            local setup = resolve_setup_alliance(unit)
+            if setup then
+                return unit
+            end
         end
     end
+    return nil
 end
 
+local function find_fallback_player_unit()
+    -- CA defines get_player_alliance() relative to the local player. Do not
+    -- scan the enemy alliance or infer ownership from a potentially AI-controlled
+    -- garrison unit; membership in this alliance is the authoritative filter.
+    local ok_alliance, alliance = safe(function()
+        return bm:get_player_alliance()
+    end)
+    if not ok_alliance or not alliance then
+        return nil
+    end
 
-local function poll_for_anchor()
+    local ok_armies, armies = safe(function()
+        return alliance:armies()
+    end)
+    if not ok_armies or not armies then
+        return nil
+    end
+
+    local ok_army_count, army_count = safe(function()
+        return armies:count()
+    end)
+    if not ok_army_count or type(army_count) ~= "number" or army_count < 1 then
+        return nil
+    end
+
+    for i = 1, army_count do
+        local ok_army, army = safe(function()
+            return armies:item(i)
+        end)
+        if ok_army and army then
+            local ok_units, units = safe(function()
+                return army:units()
+            end)
+            if ok_units then
+                local valid = find_valid_unit_in_collection(units)
+                if valid then
+                    return valid
+                end
+            end
+
+            -- CA exposes a separate list for some reinforcement groups.
+            local ok_rein_count, rein_count = safe(function()
+                return army:num_reinforcement_units()
+            end)
+            if ok_rein_count and type(rein_count) == "number" and rein_count > 0 then
+                for k = 1, rein_count do
+                    local ok_rein, rein_units = safe(function()
+                        return army:get_reinforcement_units(k)
+                    end)
+                    if ok_rein then
+                        local valid = find_valid_unit_in_collection(rein_units)
+                        if valid then
+                            return valid
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return nil
+end
+
+-- ============================================================================
+-- Race-safe one-time bootstrap
+--
+-- 1. CA phase change callback (shared list, no exclusive unit selection hook).
+-- 2. Inexpensive phase watch, only until Deployed; no native reads prebattle.
+-- 3. Eight bounded, spaced unit-acquisition retries if the objects are late.
+-- Each route goes through the same guard and same native-safety checks.
+-- ============================================================================
+
+local attempt_bootstrap
+
+attempt_bootstrap = function()
+    if stopped or unlocked or current_phase() ~= "Deployed" then
+        return
+    end
+
+    bootstrap_attempts = bootstrap_attempts + 1
+    local unit = find_fallback_player_unit()
+    if unit then
+        log("Validated player-alliance unit on attempt " .. tostring(bootstrap_attempts))
+        initialize_from_unit(unit)
+    else
+        log("No validated player-alliance unit on attempt " .. tostring(bootstrap_attempts))
+    end
+
     if stopped or unlocked then
         return
     end
 
-    local phase = current_phase()
-
-    if phase == "Deployed" then
-        if anchor_unit then
-            local source_phase = anchor_source_phase
-            initialize_from_unit(anchor_unit)
-
-            if stopped or unlocked then
-                return
-            end
-
-            -- initialize_from_unit only returns without stop/unlock if a cached
-            -- pre-Deployed anchor was rejected as stale. Wait for a fresh player
-            -- selection instead of repeatedly retrying the same userdata.
-            if source_phase ~= "Deployed" and not anchor_unit then
-                waiting_for_anchor_logged = false
-            end
-        elseif not waiting_for_anchor_logged then
-            waiting_for_anchor_logged = true
-            log("Phase=Deployed but no player unit anchor is cached; waiting for the first player-unit selection.")
-        end
+    local delay = RETRY_DELAYS_MS[bootstrap_attempts]
+    if delay then
+        bm:callback(attempt_bootstrap, delay)
+    else
+        log("Bootstrap retry budget exhausted; no further native scans will run.")
     end
-
-    bm:callback(poll_for_anchor, 200)
 end
 
+local function on_deployed(trigger)
+    if bootstrap_started or stopped or unlocked or current_phase() ~= "Deployed" then
+        return
+    end
+
+    bootstrap_started = true
+    log("Deployed bootstrap source=" .. tostring(trigger))
+    attempt_bootstrap()
+end
+
+local function phase_watch()
+    if stopped or unlocked or bootstrap_started then
+        return
+    end
+
+    if current_phase() == "Deployed" then
+        on_deployed("phase_watch")
+    else
+        -- Only a phase-name read, never a unit scan or native memory read.
+        bm:callback(phase_watch, 500)
+    end
+end
 
 -- ============================================================================
 -- Init
@@ -529,16 +609,17 @@ if not mr then
     return
 end
 
-local registered = safe(function()
-    bm:register_unit_selection_handler(
-        "NATIVE_WITHDRAW_UNLOCK_SELECTION_HANDLER"
-    )
+-- This CA wrapper appends to a callback LIST, unlike the native single
+-- register_unit_selection_handler() slot used by AI Army Control.
+local phase_handler_ok = safe(function()
+    bm:register_phase_change_callback("Deployed", function()
+        on_deployed("phase_change")
+    end)
 end)
-
-if not registered then
-    log("Failed to register unit selection handler.")
-    return
+if not phase_handler_ok then
+    log("Phase-change callback could not be registered; phase-watch remains active.")
 end
 
-log("Unit selection handler registered; preserving Deployment anchors across deselection.")
-bm:callback(poll_for_anchor, 200)
+-- The fallback is always armed even if CA's phase callback registration
+-- succeeded, in case another script alters the phase notifications.
+bm:callback(phase_watch, 500)
